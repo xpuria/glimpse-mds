@@ -1,0 +1,76 @@
+import argparse
+from pathlib import Path
+import pandas as pd
+import datetime
+import os
+from datasets import Dataset
+from tqdm import tqdm
+
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from generate_extractive_candidates import evaluate_summarizer as extractive_summarizer
+from generate_abstractive_candidates import evaluate_summarizer as abstractive_summarizer
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hybrid Summarization (Extractive + Abstractive)")
+    parser.add_argument("--dataset_path", type=Path, required=True, help="Path to the input dataset (CSV).")
+    parser.add_argument("--output_dir", type=str, default="data/hybrid_candidates", help="Path to save hybrid summaries.")
+    parser.add_argument("--extractive_output_path", type=Path, default="data/extractive_candidates.csv",
+                        help="Temporary path to save extractive summaries.")
+    parser.add_argument("--abstractive_model_name", type=str, default="facebook/bart-large-cnn",
+                        help="Abstractive summarization model name or path.")
+    parser.add_argument("--abstractive_decoding_config", type=str, default="top_p_sampling",
+                        help="Decoding strategy for abstractive summarization.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for abstractive summarization.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for abstractive summarization.")
+    return parser.parse_args()
+
+def prepare_dataset(dataset_path: Path) -> Dataset:
+    try:
+        dataset = pd.read_csv(dataset_path)
+    except Exception as e:
+        raise ValueError(f"Error reading dataset: {e}")
+    if "text" not in dataset.columns:
+        raise ValueError("Dataset must contain a 'text' column.")
+    return Dataset.from_pandas(dataset)
+
+def save_dataset(dataset, output_path: Path):
+    df = dataset.to_pandas()
+    os.makedirs(output_path.parent, exist_ok=True)
+    df.to_csv(output_path, index=False, encoding="utf-8")
+    print(f"Saved dataset to {output_path}")
+
+def main():
+    args = parse_args()
+
+    # Step 1: Extractive Summarization Phase
+    print("Running extractive summarization...")
+    dataset = prepare_dataset(args.dataset_path)
+    extractive_dataset = extractive_summarizer(dataset)
+    save_dataset(extractive_dataset, args.extractive_output_path)
+
+    # Step 2: Prepare Extractive Summaries for Abstractive Phase
+    extractive_df = pd.read_csv(args.extractive_output_path)
+    if "summary" not in extractive_df.columns:
+        raise ValueError("Extractive summary must have a 'summary' column.")
+    dataset = Dataset.from_pandas(extractive_df.rename(columns={"summary": "text"}))
+
+    # Step 3: Abstractive Summarization Phase
+    print("Running abstractive summarization...")
+    abstractive_model = AutoModelForSeq2SeqLM.from_pretrained(args.abstractive_model_name).to(args.device)
+    abstractive_tokenizer = AutoTokenizer.from_pretrained(args.abstractive_model_name)
+    hybrid_dataset = abstractive_summarizer(
+        model=abstractive_model,
+        tokenizer=abstractive_tokenizer,
+        dataset=dataset,
+        decoding_config=args.abstractive_decoding_config,
+        batch_size=args.batch_size,
+        device=args.device,
+    )
+
+    # Step 4: Save Final Hybrid Summaries
+    final_output_path = Path(args.output_dir) / f"hybrid_summaries-{datetime.datetime.now():%Y%m%d%H%M%S}.csv"
+    save_dataset(hybrid_dataset, final_output_path)
+    print(f"Hybrid summarization completed. Results saved to {final_output_path}")
+
+if __name__ == "__main__":
+    main()
