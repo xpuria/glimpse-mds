@@ -1,7 +1,7 @@
 import sys
 import os.path
 # Add path to find rsasumm
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
 from pathlib import Path
 import pandas as pd
