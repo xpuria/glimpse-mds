@@ -1,7 +1,7 @@
 import sys
 import os.path
 # Add path to find rsasumm
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
 
 from pathlib import Path
 import pandas as pd
@@ -25,8 +25,8 @@ def parse_args():
     parser.add_argument("--filter", type=str, default=None)
     parser.add_argument("--scripted-run", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=8)  # Reduced batch size
-    parser.add_argument("--max_length", type=int, default=512)  # Add max length parameter
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--max_length", type=int, default=512)
     return parser.parse_args()
 
 def parse_summaries(path: Path) -> pd.DataFrame:
@@ -46,53 +46,47 @@ def parse_summaries(path: Path) -> pd.DataFrame:
 
     return summaries
 
-def compute_rsa(summaries: pd.DataFrame, model, tokenizer, device, batch_size: int, max_length: int):
+def compute_rsa(summaries: pd.DataFrame, model, tokenizer, device):
     results = []
+    model.eval()  # Ensure model is in eval mode
     
-    # Enable gradient checkpointing to save memory
-    if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    
-    for name, group in tqdm(summaries.groupby(["id"])):
+    print("Starting RSA computation...")
+    for name, group in tqdm(summaries.groupby(["id"]), desc="Processing groups"):
         try:
             # Clear CUDA cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            
-            # Truncate texts if they're too long
-            truncated_texts = [text[:max_length*4] for text in group.text.unique().tolist()]
             
             rsa_reranker = RSAReranking(
                 model,
                 tokenizer,
                 device=device,
                 candidates=group.summary.unique().tolist(),
-                source_texts=truncated_texts,
-                batch_size=batch_size,
+                source_texts=group.text.unique().tolist(),
+                batch_size=32,
                 rationality=3,
             )
             
-            with torch.inference_mode():  # Use inference mode instead of no_grad
-                (
-                    best_rsa,
-                    best_base,
-                    speaker_df,
-                    listener_df,
-                    initial_listener,
-                    language_model_proba_df,
-                    initial_consensuality_scores,
-                    consensuality_scores,
-                ) = rsa_reranker.rerank(t=2)
+            (
+                best_rsa,
+                best_base,
+                speaker_df,
+                listener_df,
+                initial_listener,
+                language_model_proba_df,
+                initial_consensuality_scores,
+                consensuality_scores,
+            ) = rsa_reranker.rerank(t=2)
 
             gold = group['gold'].tolist()[0]
 
             results.append(
                 {
                     "id": name,
-                    "best_rsa": best_rsa,
-                    "best_base": best_base,
-                    "speaker_df": speaker_df,
-                    "listener_df": listener_df,
+                    "best_rsa": best_rsa,  # best speaker score
+                    "best_base": best_base,  # naive baseline
+                    "speaker_df": speaker_df,  # all speaker results
+                    "listener_df": listener_df,  # all listener results
                     "initial_listener": initial_listener,
                     "language_model_proba_df": language_model_proba_df,
                     "initial_consensuality_scores": initial_consensuality_scores,
@@ -102,6 +96,7 @@ def compute_rsa(summaries: pd.DataFrame, model, tokenizer, device, batch_size: i
                     "text_candidates": group
                 }
             )
+            
         except RuntimeError as e:
             print(f"Error processing group {name}: {str(e)}")
             # Add empty result for failed group
@@ -121,13 +116,15 @@ def main():
         if args.filter not in args.summaries.stem:
             return
 
-    # Set memory efficient attention
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    # Load the model and tokenizer
+    print(f"Loading model {args.model_name}...")
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    ).to(args.device)
 
-    # Load the model and the tokenizer
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name, 
-                                                 device_map=args.device,
-                                                 torch_dtype=torch.float16)  # Use fp16
+    print("Loading tokenizer...")
     if "pegasus" in args.model_name:
         tokenizer = PegasusTokenizer.from_pretrained(args.model_name)
     else:
@@ -143,8 +140,7 @@ def main():
     summaries = parse_summaries(args.summaries)
 
     # Rerank the summaries
-    print("Computing RSA scores...")
-    results = compute_rsa(summaries, model, tokenizer, args.device, args.batch_size, args.max_length)
+    results = compute_rsa(summaries, model, tokenizer, args.device)
     results = {"results": results}
 
     results["metadata/reranking_model"] = args.model_name
