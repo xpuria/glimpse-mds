@@ -113,13 +113,11 @@ def main():
         torch.cuda.empty_cache()
     
     print(f"\nLoading model: {args.model_name}")
-    # Load model with automatic device mapping
+    # Load model with basic configuration
     model = AutoModelForSeq2SeqLM.from_pretrained(
         args.model_name,
-        device_map="auto",
         torch_dtype=torch.float16,
-        load_in_4bit=True  # Enable 4-bit quantization for memory efficiency
-    )
+    ).to(args.device)
 
     print("Loading tokenizer...")
     if "pegasus" in args.model_name:
