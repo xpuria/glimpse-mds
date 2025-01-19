@@ -1,95 +1,156 @@
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-
 import argparse
 from pathlib import Path
 import pandas as pd
 import datetime
-import os
+import torch
 from datasets import Dataset
 from tqdm import tqdm
-
+import nltk
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from glimpse.data_loading.generate_extractive_candidates import evaluate_summarizer as extractive_summarizer
-from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as abstractive_summarizer
+from torch.utils.data import DataLoader
+
+GENERATION_CONFIGS = {
+    "top_p_sampling": {
+        "max_new_tokens": 200,
+        "do_sample": True,
+        "top_p": 0.95,
+        "temperature": 1.0,
+        "num_return_sequences": 8,
+        "num_beams": 1,
+        "min_length": 0,
+        "early_stopping": True,
+    }
+}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hybrid Summarization (Extractive + Abstractive)")
-    parser.add_argument("--dataset_path", type=Path, required=True, help="Path to the input dataset (CSV).")
-    parser.add_argument("--output_dir", type=str, default="data/hybrid_candidates", help="Path to save hybrid summaries.")
-    parser.add_argument("--extractive_output_path", type=Path, default="data/extractive_candidates.csv",
-                        help="Temporary path to save extractive summaries.")
-    parser.add_argument("--abstractive_model_name", type=str, default="facebook/bart-large-cnn",
-                        help="Abstractive summarization model name or path.")
-    parser.add_argument("--abstractive_decoding_config", type=str, default="top_p_sampling",
-                        help="Decoding strategy for abstractive summarization.")
-    parser.add_argument("--extractive_decoding_config", type=str, default="top_p_sampling",
-                        help="Decoding strategy for extractive summarization.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for summarization.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device for summarization.")
+    parser.add_argument("--dataset_path", type=Path, required=True, 
+                       help="Path to the input dataset (CSV)")
+    parser.add_argument("--output_dir", type=str, default="data/hybrid_candidates",
+                       help="Directory to save output files")
+    parser.add_argument("--model_name", type=str, default="facebook/bart-large-cnn",
+                       help="Model name for abstractive summarization")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--limit", type=int, default=None,
+                       help="Limit number of samples to process")
     return parser.parse_args()
 
 def prepare_dataset(dataset_path: Path) -> Dataset:
     try:
         dataset = pd.read_csv(dataset_path)
+        return Dataset.from_pandas(dataset)
     except Exception as e:
         raise ValueError(f"Error reading dataset: {e}")
-    if "text" not in dataset.columns:
-        raise ValueError("Dataset must contain a 'text' column.")
-    return Dataset.from_pandas(dataset)
 
-def save_dataset(dataset, output_path: Path):
-    df = dataset.to_pandas()
-    os.makedirs(output_path.parent, exist_ok=True)
-    df.to_csv(output_path, index=False, encoding="utf-8")
-    print(f"Saved dataset to {output_path}")
+def extractive_summarization(dataset: Dataset) -> Dataset:
+    """Generate extractive summaries by sentence tokenization"""
+    summaries = []
+    print("Generating extractive summaries...")
+    
+    for sample in tqdm(dataset):
+        text = sample["text"]
+        text = text.replace('-----', '\n')
+        sentences = nltk.sent_tokenize(text)
+        sentences = [sent for sent in sentences if sent.strip()]
+        summaries.append(sentences)
+    
+    return dataset.map(lambda example: {"extractive_summary": summaries.pop(0)})
+
+def abstractive_summarization(
+    model, tokenizer, dataset: Dataset, 
+    batch_size: int, device: str
+) -> Dataset:
+    """Generate abstractive summaries using the transformer model"""
+    print("Generating abstractive summaries...")
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    summaries = []
+
+    for batch in tqdm(dataloader):
+        # For abstractive summarization, we'll use the extractive summaries as input
+        texts = [" ".join(summary[:3]) for summary in batch["extractive_summary"]]
+        
+        inputs = tokenizer(
+            texts,
+            max_length=1024,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        ).to(device)
+
+        outputs = model.generate(
+            **inputs,
+            **GENERATION_CONFIGS["top_p_sampling"]
+        )
+
+        batch_summaries = []
+        for output in outputs.reshape(len(texts), -1, outputs.shape[-1]):
+            batch_summaries.append([
+                tokenizer.decode(seq, skip_special_tokens=True)
+                for seq in output
+            ])
+        summaries.extend(batch_summaries)
+
+    return dataset.map(lambda example: {"abstractive_summary": summaries.pop(0)})
 
 def main():
     args = parse_args()
-
-    # Step 1: Extractive Summarization Phase
-    print("Running extractive summarization...")
+    
+    # Initialize NLTK
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt')
+    
+    # Load dataset
+    print("Loading dataset...")
     dataset = prepare_dataset(args.dataset_path)
-
-    # Load model and tokenizer for extractive summarization
-    extractive_model = AutoModelForSeq2SeqLM.from_pretrained(args.abstractive_model_name).to(args.device)
-    extractive_tokenizer = AutoTokenizer.from_pretrained(args.abstractive_model_name)
-    extractive_dataset = extractive_summarizer(
-        model=extractive_model,
-        tokenizer=extractive_tokenizer,
-        dataset=dataset,
-        decoding_config=args.extractive_decoding_config,
-        batch_size=args.batch_size,
-        device=args.device,
+    
+    if args.limit:
+        dataset = dataset.select(range(min(args.limit, len(dataset))))
+    
+    # Step 1: Extractive Summarization
+    dataset = extractive_summarization(dataset)
+    
+    # Step 2: Abstractive Summarization
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name).to(args.device)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    
+    # Set padding token if not set
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    dataset = abstractive_summarization(
+        model, tokenizer, dataset,
+        args.batch_size, args.device
     )
-    save_dataset(extractive_dataset, args.extractive_output_path)
-
-    # Step 2: Prepare Extractive Summaries for Abstractive Phase
-    extractive_df = pd.read_csv(args.extractive_output_path)
-    if "summary" not in extractive_df.columns:
-        raise ValueError("Extractive summary must have a 'summary' column.")
-    # Drop the original "text" column to avoid duplicate names
-    extractive_df = extractive_df.drop(columns=["text"])
-    dataset = Dataset.from_pandas(extractive_df.rename(columns={"summary": "text"}))
-
-    # Step 3: Abstractive Summarization Phase
-    print("Running abstractive summarization...")
-    abstractive_model = AutoModelForSeq2SeqLM.from_pretrained(args.abstractive_model_name).to(args.device)
-    abstractive_tokenizer = AutoTokenizer.from_pretrained(args.abstractive_model_name)
-    hybrid_dataset = abstractive_summarizer(
-        model=abstractive_model,
-        tokenizer=abstractive_tokenizer,
-        dataset=dataset,
-        decoding_config=args.abstractive_decoding_config,
-        batch_size=args.batch_size,
-        device=args.device,
-    )
-
-    # Step 4: Save Final Hybrid Summaries
-    final_output_path = Path(args.output_dir) / f"hybrid_summaries-{datetime.datetime.now():%Y%m%d%H%M%S}.csv"
-    save_dataset(hybrid_dataset, final_output_path)
-    print(f"Hybrid summarization completed. Results saved to {final_output_path}")
+    
+    # Convert to DataFrame and save
+    df_dataset = dataset.to_pandas()
+    
+    # Process summaries
+    df_final = pd.DataFrame()
+    for idx, row in df_dataset.iterrows():
+        # Combine extractive and abstractive summaries
+        extractive_summaries = row['extractive_summary']
+        abstractive_summaries = row['abstractive_summary']
+        
+        for ext_idx, ext_sum in enumerate(extractive_summaries):
+            for abs_idx, abs_sum in enumerate(abstractive_summaries):
+                df_final = pd.concat([df_final, pd.DataFrame({
+                    'text': [row['text']],
+                    'extractive_summary': [ext_sum],
+                    'abstractive_summary': [abs_sum],
+                    'original_index': [idx],
+                    'extractive_id': [ext_idx],
+                    'abstractive_id': [abs_idx]
+                })])
+    
+    # Save results
+    output_path = Path(args.output_dir) / f"hybrid_summaries_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df_final.to_csv(output_path, index=False)
+    print(f"Saved hybrid summaries to {output_path}")
 
 if __name__ == "__main__":
     main()
