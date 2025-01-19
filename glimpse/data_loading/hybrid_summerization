@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # Import extractive and abstractive summarization methods
-from glimpse.data_loading.generate_extractive_candidates import evaluate_summarizer as extractive_summarizer
+from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as extractive_summarizer
 from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as abstractive_summarizer
 
 
