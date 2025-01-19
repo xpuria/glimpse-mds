@@ -1,141 +1,139 @@
-from pathlib import Path
-
-import pandas as pd
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PegasusTokenizer
 import argparse
+from pathlib import Path
+import pandas as pd
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, PegasusTokenizer
 from tqdm import tqdm
-
 from pickle import dump
-
-import sys, os.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from rsasumm.rsa_reranker import RSAReranking
 
-
-DESC = """
-Compute the RSA matrices for all the set of multi-document samples and dump these along with additional information in a pickle file.
-"""
-
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default="google/pegasus-arxiv")
-    parser.add_argument("--summaries", type=Path, default="")
-    parser.add_argument("--output_dir", type=str, default="output")
-
-    parser.add_argument("--filter", type=str, default=None)
-    
-    # if ran in a scripted way, the output path will be printed
-    parser.add_argument("--scripted-run", action=argparse.BooleanOptionalAction, default=False)
-
+    parser = argparse.ArgumentParser(description="Compute RSA matrices and rerank summaries")
+    parser.add_argument("--model_name", type=str, default="facebook/bart-large-cnn")
+    parser.add_argument("--summaries", type=Path, required=True)
+    parser.add_argument("--output_dir", type=str, default="data/rsa_results")
     parser.add_argument("--device", type=str, default="cuda")
-
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--rationality", type=float, default=3.0)
+    parser.add_argument("--filter", type=str, default=None)
+    parser.add_argument("--scripted-run", action="store_true")
     return parser.parse_args()
 
-
 def parse_summaries(path: Path) -> pd.DataFrame:
-    
+    """Parse and validate input summaries file"""
     try:
         summaries = pd.read_csv(path)
-    except:
-        raise ValueError(f"Unknown dataset {path}")
+        required_cols = ['index', 'id', 'text', 'gold', 'summary', 'id_candidate']
+        if not all(col in summaries.columns for col in required_cols):
+            raise ValueError(f"DataFrame must have columns: {required_cols}")
+        return summaries
+    except Exception as e:
+        raise ValueError(f"Error reading summaries file: {e}")
 
-    # check if the dataframe has the right columns
-    if not all(
-        col in summaries.columns for col in ["index", "id", "text", "gold", "summary", "id_candidate"]
-    ):
-        raise ValueError(
-            "The dataframe must have columns ['index', 'id', 'text', 'gold', 'summary', 'id_candidate']"
-        )
-
-    return summaries
-
-
-def compute_rsa(summaries: pd.DataFrame, model, tokenizer, device):
+def compute_rsa(summaries: pd.DataFrame, model, tokenizer, device: str, 
+                batch_size: int = 32, rationality: float = 3.0):
+    """Compute RSA scores and rerank summaries"""
     results = []
+    
+    print("Computing RSA scores...")
     for name, group in tqdm(summaries.groupby(["id"])):
+        # Initialize RSA reranker
         rsa_reranker = RSAReranking(
-            model,
-            tokenizer,
+            model=model,
+            tokenizer=tokenizer,
             device=device,
             candidates=group.summary.unique().tolist(),
             source_texts=group.text.unique().tolist(),
-            batch_size=32,
-            rationality=3,
+            batch_size=batch_size,
+            rationality=rationality
         )
+        
+        # Compute RSA scores
         (
-            best_rsa,
-            best_base,
-            speaker_df,
-            listener_df,
-            initial_listener,
-            language_model_proba_df,
-            initial_consensuality_scores,
-            consensuality_scores,
-        ) = rsa_reranker.rerank(t=2)
+            best_rsa,          # Best summaries by RSA
+            best_base,         # Best summaries by base model
+            speaker_df,        # Speaker probabilities
+            listener_df,       # Listener probabilities
+            initial_listener,  # Initial listener model
+            language_model_proba_df,  # Language model probabilities
+            initial_consensuality_scores,  # Initial consensuality
+            consensuality_scores,  # Final consensuality
+        ) = rsa_reranker.rerank(t=2)  # Use 2 iterations
 
-        gold = group['gold'].tolist()[0]
+        # Get gold summary for this group
+        gold = group['gold'].iloc[0]
 
-        results.append(
-            {
-                "id": name,
-                "best_rsa": best_rsa,  # best speaker score
-                "best_base": best_base,  # naive baseline
-                "speaker_df": speaker_df,  # all speaker results
-                "listener_df": listener_df,  # all listener results (chances of guessing correctly)
-                "initial_listener": initial_listener,
-                "language_model_proba_df": language_model_proba_df,
-                "initial_consensuality_scores": initial_consensuality_scores,
-                "consensuality_scores": consensuality_scores,  # uniqueness scores
-                "gold": gold,
-                "rationality": 3,  # hyperparameter
-                "text_candidates" : group
-            }
-        )
+        # Store results
+        results.append({
+            "id": name,
+            "best_rsa": best_rsa,
+            "best_base": best_base,
+            "speaker_df": speaker_df,
+            "listener_df": listener_df,
+            "initial_listener": initial_listener,
+            "language_model_proba_df": language_model_proba_df,
+            "initial_consensuality_scores": initial_consensuality_scores,
+            "consensuality_scores": consensuality_scores,
+            "gold": gold,
+            "rationality": rationality,
+            "text_candidates": group
+        })
 
     return results
 
-
 def main():
     args = parse_args()
-
-    if args.filter is not None:
-        if args.filter not in args.summaries.stem:
-            return
-
-    # load the model and the tokenizer
-    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name)
-    if "pegasus" in args.model_name: 
+    
+    # Filter check
+    if args.filter and args.filter not in args.summaries.stem:
+        return
+        
+    # Load model and tokenizer
+    print(f"Loading model: {args.model_name}")
+    model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name).to(args.device)
+    if "pegasus" in args.model_name:
         tokenizer = PegasusTokenizer.from_pretrained(args.model_name)
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    model = model.to(args.device)
-
-    # load the summaries
-    summaries = parse_summaries(args.summaries)
-
-    # rerank the summaries
-    results = compute_rsa(summaries, model, tokenizer, args.device)
-    results = {"results": results}
-
-    results["metadata/reranking_model"] = args.model_name
-    results["metadata/rsa_iterations"] = 3
-
-    # save the summaries
-    # make the output directory if it does not exist
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    output_path = Path(args.output_dir) / f"{args.summaries.stem}-_-r3-_-rsa_reranked-{args.model_name.replace('/', '-')}.pk"
-    output_path_base = (
-        Path(args.output_dir) / f"{args.summaries.stem}-_-base_reranked.pk"
-    )
-
-    with open(output_path, "wb") as f:
-        dump(results, f)
         
-    # in case of scripted run, print the output path
-    if args.scripted_run: print(output_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Load and process summaries
+    print("Loading summaries...")
+    summaries = parse_summaries(args.summaries)
+    
+    # Compute RSA scores
+    results = compute_rsa(
+        summaries=summaries,
+        model=model,
+        tokenizer=tokenizer,
+        device=args.device,
+        batch_size=args.batch_size,
+        rationality=args.rationality
+    )
+    
+    # Package results
+    output_data = {
+        "results": results,
+        "metadata/reranking_model": args.model_name,
+        "metadata/rsa_iterations": 2
+    }
+    
+    # Save results
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    output_path = output_dir / f"{args.summaries.stem}-_-r{args.rationality}-_-rsa_reranked-{args.model_name.replace('/', '-')}.pk"
+    
+    print(f"Saving results to: {output_path}")
+    with open(output_path, "wb") as f:
+        dump(output_data, f)
+        
+    if args.scripted_run:
+        print(output_path)
 
 if __name__ == "__main__":
     main()
