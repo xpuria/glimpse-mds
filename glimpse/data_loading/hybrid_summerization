@@ -7,7 +7,6 @@ from datasets import Dataset
 from tqdm import tqdm
 import nltk
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from torch.utils.data import DataLoader
 
 GENERATION_CONFIGS = {
     "top_p_sampling": {
@@ -37,8 +36,12 @@ def parse_args():
     return parser.parse_args()
 
 def prepare_dataset(dataset_path: Path) -> Dataset:
+    """Load and prepare dataset, ensuring required columns exist"""
     try:
         dataset = pd.read_csv(dataset_path)
+        required_columns = ['id', 'text', 'gold']
+        if not all(col in dataset.columns for col in required_columns):
+            raise ValueError(f"Dataset must contain columns: {required_columns}")
         return Dataset.from_pandas(dataset)
     except Exception as e:
         raise ValueError(f"Error reading dataset: {e}")
@@ -53,9 +56,37 @@ def extractive_summarization(dataset: Dataset) -> Dataset:
         text = text.replace('-----', '\n')
         sentences = nltk.sent_tokenize(text)
         sentences = [sent for sent in sentences if sent.strip()]
+        # Take first 3 sentences or pad with empty strings if less than 3
+        while len(sentences) < 3:
+            sentences.append("")
+        sentences = sentences[:3]  # Limit to first 3 sentences
         summaries.append(sentences)
     
     return dataset.map(lambda example: {"extractive_summary": summaries.pop(0)})
+
+def process_batch(batch_texts, model, tokenizer, device):
+    """Process a batch of texts through the model"""
+    inputs = tokenizer(
+        batch_texts,
+        max_length=1024,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    ).to(device)
+
+    outputs = model.generate(
+        **inputs,
+        **GENERATION_CONFIGS["top_p_sampling"]
+    )
+
+    # Reshape outputs and decode
+    summaries = []
+    for output in outputs.reshape(len(batch_texts), -1, outputs.shape[-1]):
+        summaries.append([
+            tokenizer.decode(seq, skip_special_tokens=True)
+            for seq in output
+        ])
+    return summaries
 
 def abstractive_summarization(
     model, tokenizer, dataset: Dataset, 
@@ -63,35 +94,25 @@ def abstractive_summarization(
 ) -> Dataset:
     """Generate abstractive summaries using the transformer model"""
     print("Generating abstractive summaries...")
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    summaries = []
-
-    for batch in tqdm(dataloader):
-        # For abstractive summarization, we'll use the extractive summaries as input
-        texts = [" ".join(summary[:3]) for summary in batch["extractive_summary"]]
+    all_summaries = []
+    
+    # Process in batches without using DataLoader
+    for i in tqdm(range(0, len(dataset), batch_size)):
+        batch_data = dataset[i:i + batch_size]
+        # Join extractive summaries into single texts
+        batch_texts = [" ".join(summary) for summary in batch_data["extractive_summary"]]
         
-        inputs = tokenizer(
-            texts,
-            max_length=1024,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt"
-        ).to(device)
-
-        outputs = model.generate(
-            **inputs,
-            **GENERATION_CONFIGS["top_p_sampling"]
-        )
-
-        batch_summaries = []
-        for output in outputs.reshape(len(texts), -1, outputs.shape[-1]):
-            batch_summaries.append([
-                tokenizer.decode(seq, skip_special_tokens=True)
-                for seq in output
-            ])
-        summaries.extend(batch_summaries)
-
-    return dataset.map(lambda example: {"abstractive_summary": summaries.pop(0)})
+        try:
+            batch_summaries = process_batch(batch_texts, model, tokenizer, device)
+            all_summaries.extend(batch_summaries)
+        except Exception as e:
+            print(f"Error processing batch {i}: {e}")
+            # Add empty summaries for failed batch
+            all_summaries.extend([[""]] * len(batch_texts))
+    
+    return dataset.map(lambda example, idx: {
+        "abstractive_summary": all_summaries[idx]
+    }, with_indices=True)
 
 def main():
     args = parse_args()
@@ -128,23 +149,22 @@ def main():
     # Convert to DataFrame and save
     df_dataset = dataset.to_pandas()
     
-    # Process summaries
+    # Process summaries for RSA computation format
     df_final = pd.DataFrame()
     for idx, row in df_dataset.iterrows():
-        # Combine extractive and abstractive summaries
-        extractive_summaries = row['extractive_summary']
         abstractive_summaries = row['abstractive_summary']
         
-        for ext_idx, ext_sum in enumerate(extractive_summaries):
-            for abs_idx, abs_sum in enumerate(abstractive_summaries):
+        # For RSA computation format
+        for id_candidate, summary in enumerate(abstractive_summaries):
+            if summary.strip():  # Only include non-empty summaries
                 df_final = pd.concat([df_final, pd.DataFrame({
+                    'index': [idx],
+                    'id': [row['id']],  # Use original ID from dataset
                     'text': [row['text']],
-                    'extractive_summary': [ext_sum],
-                    'abstractive_summary': [abs_sum],
-                    'original_index': [idx],
-                    'extractive_id': [ext_idx],
-                    'abstractive_id': [abs_idx]
-                })])
+                    'gold': [row['gold']],  # Include gold summary from original data
+                    'summary': [summary],
+                    'id_candidate': [id_candidate]
+                })], ignore_index=True)
     
     # Save results
     output_path = Path(args.output_dir) / f"hybrid_summaries_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv"
