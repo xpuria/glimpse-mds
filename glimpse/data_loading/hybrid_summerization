@@ -11,11 +11,8 @@ from datasets import Dataset
 from tqdm import tqdm
 
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-
-# Import extractive and abstractive summarization methods
-from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as extractive_summarizer
+from glimpse.data_loading.generate_extractive_candidates import evaluate_summarizer as extractive_summarizer
 from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as abstractive_summarizer
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Hybrid Summarization (Extractive + Abstractive)")
@@ -27,15 +24,13 @@ def parse_args():
                         help="Abstractive summarization model name or path.")
     parser.add_argument("--abstractive_decoding_config", type=str, default="top_p_sampling",
                         help="Decoding strategy for abstractive summarization.")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for abstractive summarization.")
-    parser.add_argument("--device", type=str, default="cuda", help="Device for abstractive summarization.")
+    parser.add_argument("--extractive_decoding_config", type=str, default="top_p_sampling",
+                        help="Decoding strategy for extractive summarization.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for summarization.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for summarization.")
     return parser.parse_args()
 
-
 def prepare_dataset(dataset_path: Path) -> Dataset:
-    """
-    Load a dataset from a CSV file and convert it to a Hugging Face Dataset.
-    """
     try:
         dataset = pd.read_csv(dataset_path)
     except Exception as e:
@@ -44,37 +39,11 @@ def prepare_dataset(dataset_path: Path) -> Dataset:
         raise ValueError("Dataset must contain a 'text' column.")
     return Dataset.from_pandas(dataset)
 
-
 def save_dataset(dataset, output_path: Path):
-    """
-    Save a Hugging Face Dataset to a CSV file, ensuring required columns are added or renamed.
-    """
     df = dataset.to_pandas()
-
-    # Ensure required columns are present and consistent
-    if "index" not in df.columns:
-        df["index"] = range(len(df))  # Add an index column if missing
-
-    if "id" not in df.columns:
-        df["id"] = df["index"]  # Add an `id` column using the `index` column as fallback
-
-    if "id_candidate" not in df.columns:
-        df["id_candidate"] = df.groupby(["index"]).cumcount()
-
-    # Rename columns for consistency
-    df.rename(columns={"text": "text", "gold": "gold", "summary": "summary"}, inplace=True)
-
-    # Ensure all required columns are present
-    required_columns = ["index", "id", "text", "gold", "summary", "id_candidate"]
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    if missing_columns:
-        raise ValueError(f"Dataset is missing required columns: {missing_columns}")
-
-    # Save the updated dataset
     os.makedirs(output_path.parent, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8")
     print(f"Saved dataset to {output_path}")
-
 
 def main():
     args = parse_args()
@@ -82,7 +51,18 @@ def main():
     # Step 1: Extractive Summarization Phase
     print("Running extractive summarization...")
     dataset = prepare_dataset(args.dataset_path)
-    extractive_dataset = extractive_summarizer(dataset)
+
+    # Load model and tokenizer for extractive summarization
+    extractive_model = AutoModelForSeq2SeqLM.from_pretrained(args.abstractive_model_name).to(args.device)
+    extractive_tokenizer = AutoTokenizer.from_pretrained(args.abstractive_model_name)
+    extractive_dataset = extractive_summarizer(
+        model=extractive_model,
+        tokenizer=extractive_tokenizer,
+        dataset=dataset,
+        decoding_config=args.extractive_decoding_config,
+        batch_size=args.batch_size,
+        device=args.device,
+    )
     save_dataset(extractive_dataset, args.extractive_output_path)
 
     # Step 2: Prepare Extractive Summaries for Abstractive Phase
@@ -90,7 +70,7 @@ def main():
     if "summary" not in extractive_df.columns:
         raise ValueError("Extractive summary must have a 'summary' column.")
     # Drop the original "text" column to avoid duplicate names
-    extractive_df = extractive_df.drop(columns=["text"], errors="ignore")
+    extractive_df = extractive_df.drop(columns=["text"])
     dataset = Dataset.from_pandas(extractive_df.rename(columns={"summary": "text"}))
 
     # Step 3: Abstractive Summarization Phase
@@ -110,7 +90,6 @@ def main():
     final_output_path = Path(args.output_dir) / f"hybrid_summaries-{datetime.datetime.now():%Y%m%d%H%M%S}.csv"
     save_dataset(hybrid_dataset, final_output_path)
     print(f"Hybrid summarization completed. Results saved to {final_output_path}")
-
 
 if __name__ == "__main__":
     main()
