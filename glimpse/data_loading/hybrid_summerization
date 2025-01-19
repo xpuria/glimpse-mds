@@ -1,6 +1,49 @@
+import argparse
+from pathlib import Path
+import pandas as pd
+import datetime
+import os
+from datasets import Dataset
+from tqdm import tqdm
+
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+# Import extractive and abstractive summarization methods
+from glimpse.data_loading.generate_extractive_candidates import evaluate_summarizer as extractive_summarizer
+from glimpse.data_loading.generate_abstractive_candidates import evaluate_summarizer as abstractive_summarizer
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hybrid Summarization (Extractive + Abstractive)")
+    parser.add_argument("--dataset_path", type=Path, required=True, help="Path to the input dataset (CSV).")
+    parser.add_argument("--output_dir", type=str, default="data/hybrid_candidates", help="Path to save hybrid summaries.")
+    parser.add_argument("--extractive_output_path", type=Path, default="data/extractive_candidates.csv",
+                        help="Temporary path to save extractive summaries.")
+    parser.add_argument("--abstractive_model_name", type=str, default="facebook/bart-large-cnn",
+                        help="Abstractive summarization model name or path.")
+    parser.add_argument("--abstractive_decoding_config", type=str, default="top_p_sampling",
+                        help="Decoding strategy for abstractive summarization.")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for abstractive summarization.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device for abstractive summarization.")
+    return parser.parse_args()
+
+
+def prepare_dataset(dataset_path: Path) -> Dataset:
+    """
+    Load a dataset from a CSV file and convert it to a Hugging Face Dataset.
+    """
+    try:
+        dataset = pd.read_csv(dataset_path)
+    except Exception as e:
+        raise ValueError(f"Error reading dataset: {e}")
+    if "text" not in dataset.columns:
+        raise ValueError("Dataset must contain a 'text' column.")
+    return Dataset.from_pandas(dataset)
+
+
 def save_dataset(dataset, output_path: Path):
     """
-    Save the dataset to a CSV file, ensuring required columns are added or renamed.
+    Save a Hugging Face Dataset to a CSV file, ensuring required columns are added or renamed.
     """
     df = dataset.to_pandas()
 
@@ -42,11 +85,9 @@ def main():
     extractive_df = pd.read_csv(args.extractive_output_path)
     if "summary" not in extractive_df.columns:
         raise ValueError("Extractive summary must have a 'summary' column.")
-    
-    # Ensure proper column naming and drop duplicates
+    # Drop the original "text" column to avoid duplicate names
     extractive_df = extractive_df.drop(columns=["text"], errors="ignore")
-    extractive_df.rename(columns={"summary": "text"}, inplace=True)
-    dataset = Dataset.from_pandas(extractive_df)
+    dataset = Dataset.from_pandas(extractive_df.rename(columns={"summary": "text"}))
 
     # Step 3: Abstractive Summarization Phase
     print("Running abstractive summarization...")
