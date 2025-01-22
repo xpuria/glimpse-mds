@@ -155,27 +155,33 @@ class RSAReranker:
                 "error": str(e)
             }
 
-def get_device_map():
-    """Determine appropriate device for model loading"""
-    return 'cuda' if torch.cuda.is_available() else 'cpu'
-
 def load_model_safely(model_name):
-    """Load model with proper device handling"""
-    device = get_device_map()
-    logger.info(f"Using device: {device}")
+    """Load model with safeguards against meta tensor errors"""
+    # First load config and model architecture
+    config = AutoModelForSeq2SeqLM.config_class.from_pretrained(model_name)
     
-    try:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_name,
-            device_map=device,
-            torch_dtype=torch.float32
-        )
-        model.eval()
-        return model, device
-        
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise
+    # Create model instance from config first
+    model = AutoModelForSeq2SeqLM.from_config(config)
+    
+            # Load state dict separately
+    state_dict = AutoModelForSeq2SeqLM.from_pretrained(
+        model_name,
+        return_dict=False,
+        state_dict=True,
+        torch_dtype=torch.float32,
+        config=config,
+        use_safetensors=False  # Avoid safetensors to prevent meta tensor issues
+    )
+    
+    # Load state dict
+    model.load_state_dict(state_dict)
+    
+    # Move to device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device)
+    model.eval()
+    
+    return model, device
 
 def main():
     args = parse_args()
@@ -183,9 +189,15 @@ def main():
     if args.filter and args.filter not in args.summaries.stem:
         return
 
-    # Load model with device detection
+    # Load model with safe loading
     logger.info(f"Loading model: {args.model_name}")
-    model, device = load_model_safely(args.model_name)
+    try:
+        model, device = load_model_safely(args.model_name)
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise
+        
+    logger.info(f"Model loaded successfully on device: {device}")
     
     logger.info("Loading tokenizer...")
     if "pegasus" in args.model_name:
