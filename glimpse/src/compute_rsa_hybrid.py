@@ -1,18 +1,16 @@
 import sys
-import os.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../')))
-
+import os
 from pathlib import Path
 import pandas as pd
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PegasusTokenizer
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PegasusTokenizer, AutoConfig
 import argparse
 from tqdm import tqdm
 from pickle import dump
 import torch
 import gc
-import numpy as np
 import logging
 
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -29,21 +27,20 @@ def parse_args():
     return parser.parse_args()
 
 def load_model_safely(model_name, device):
-    """Load model with proper handling of meta tensors"""
-    config = AutoModelForSeq2SeqLM.config_class.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_config(config)
-    
-    # Load state dict manually
-    state_dict = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name, 
-        return_dict=False,
-        state_dict=True
-    )
-    
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-    return model
+    """Load model with safeguards against meta tensor errors."""
+    try:
+        # Load model configuration
+        config = AutoConfig.from_pretrained(model_name)
+        
+        # Load model using the configuration
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, config=config)
+        
+        # Move model to the specified device
+        model.to(device)
+        model.eval()
+        return model
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model '{model_name}': {str(e)}")
 
 class RSAReranker:
     def __init__(self, model, tokenizer, device, candidates, source_texts, batch_size=8, rationality=3.0):
@@ -56,7 +53,7 @@ class RSAReranker:
         self.rationality = rationality
 
     def compute_likelihood(self, texts, summaries):
-        """Compute likelihood scores"""
+        """Compute likelihood scores."""
         with torch.inference_mode():
             inputs = self.tokenizer(
                 texts,
@@ -78,17 +75,15 @@ class RSAReranker:
             return -outputs.loss
 
     def compute_matrix(self):
-        """Compute likelihood matrix between texts and candidates"""
+        """Compute likelihood matrix between texts and candidates."""
         logger.info("Computing likelihood matrix...")
         matrix = torch.zeros((len(self.source_texts), len(self.candidates)), device=self.device)
         
         for i in tqdm(range(0, len(self.source_texts), self.batch_size)):
             for j in range(0, len(self.candidates), self.batch_size):
-                # Get current batch
                 texts = self.source_texts[i:i + self.batch_size]
                 cands = self.candidates[j:j + self.batch_size]
                 
-                # Process all pairs in batch
                 for k, text in enumerate(texts):
                     for l, cand in enumerate(cands):
                         try:
@@ -97,45 +92,30 @@ class RSAReranker:
                         except Exception as e:
                             logger.warning(f"Error computing likelihood: {e}")
                 
-                # Clear cache between batches
+                # Clear memory
                 torch.cuda.empty_cache()
                 gc.collect()
                 
         return matrix
 
     def rerank(self, t=2):
-        """Rerank summaries using RSA"""
+        """Rerank summaries using RSA."""
         try:
-            # Get initial scores
             initial_scores = self.compute_matrix()
             logger.info("\nInitial scores computed")
             
-            # Initialize speaker scores
             speaker_scores = torch.log_softmax(initial_scores, dim=-1)
             
-            # RSA iterations
             for step in range(t):
                 logger.info(f"\nRSA Iteration {step + 1}/{t}")
-                # Listener update
                 listener_scores = torch.log_softmax(speaker_scores, dim=0)
-                
-                # Speaker update with rationality
                 speaker_scores = torch.log_softmax(
                     initial_scores + self.rationality * listener_scores,
                     dim=-1
                 )
-                
-                # Log probabilities for first example
-                if step == t-1:  # Last iteration
-                    logger.info("\nFinal probabilities for first text:")
-                    probs = speaker_scores[0].exp()
-                    for i, p in enumerate(probs):
-                        logger.info(f"Candidate {i}: {p.item():.4f}")
             
-            # Get best candidates
-            with torch.inference_mode():
-                rsa_indices = speaker_scores.argmax(dim=1).cpu()
-                base_indices = initial_scores.argmax(dim=1).cpu()
+            rsa_indices = speaker_scores.argmax(dim=1).cpu()
+            base_indices = initial_scores.argmax(dim=1).cpu()
             
             best_rsa = [self.candidates[i.item()] for i in rsa_indices]
             best_base = [self.candidates[i.item()] for i in base_indices]
@@ -147,41 +127,9 @@ class RSAReranker:
                 "speaker_scores": speaker_scores.cpu().numpy(),
                 "initial_scores": initial_scores.cpu().numpy()
             }
-            
         except Exception as e:
             logger.error(f"Error in RSA computation: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-def load_model_safely(model_name):
-    """Load model with safeguards against meta tensor errors"""
-    # First load config and model architecture
-    config = AutoModelForSeq2SeqLM.config_class.from_pretrained(model_name)
-    
-    # Create model instance from config first
-    model = AutoModelForSeq2SeqLM.from_config(config)
-    
-            # Load state dict separately
-    state_dict = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name,
-        return_dict=False,
-        state_dict=True,
-        torch_dtype=torch.float32,
-        config=config,
-        use_safetensors=False  # Avoid safetensors to prevent meta tensor issues
-    )
-    
-    # Load state dict
-    model.load_state_dict(state_dict)
-    
-    # Move to device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
-    model.eval()
-    
-    return model, device
+            return {"success": False, "error": str(e)}
 
 def main():
     args = parse_args()
@@ -189,22 +137,20 @@ def main():
     if args.filter and args.filter not in args.summaries.stem:
         return
 
-    # Load model with safe loading
     logger.info(f"Loading model: {args.model_name}")
+    device = args.device if torch.cuda.is_available() else "cpu"
+    
     try:
-        model, device = load_model_safely(args.model_name)
-    except Exception as e:
+        model = load_model_safely(args.model_name, device)
+    except RuntimeError as e:
         logger.error(f"Error loading model: {e}")
         raise
-        
+
     logger.info(f"Model loaded successfully on device: {device}")
-    
+
     logger.info("Loading tokenizer...")
-    if "pegasus" in args.model_name:
-        tokenizer = PegasusTokenizer.from_pretrained(args.model_name)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        
+    tokenizer = (PegasusTokenizer if "pegasus" in args.model_name else AutoTokenizer).from_pretrained(args.model_name)
+    
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -214,7 +160,6 @@ def main():
     
     logger.info("Processing groups...")
     for name, group in tqdm(summaries.groupby(["id"])):
-        # Clear memory
         torch.cuda.empty_cache()
         gc.collect()
         
@@ -222,7 +167,7 @@ def main():
             reranker = RSAReranker(
                 model=model,
                 tokenizer=tokenizer, 
-                device=device,  # Use detected device
+                device=device,
                 candidates=group.summary.unique().tolist(),
                 source_texts=group.text.unique().tolist(),
                 batch_size=args.batch_size,
@@ -255,11 +200,9 @@ def main():
                 "gold": group['gold'].iloc[0]
             })
 
-    # Save results
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    output_path = output_dir / f"{args.summaries.stem}-_-rsa_reranked-{args.model_name.replace('/', '-')}.pk"
+    output_path = output_dir / f"{args.summaries.stem}-rsa_reranked-{args.model_name.replace('/', '-')}.pk"
     
     with open(output_path, "wb") as f:
         dump({
