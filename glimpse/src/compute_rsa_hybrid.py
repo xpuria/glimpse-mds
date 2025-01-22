@@ -22,12 +22,28 @@ def parse_args():
     parser.add_argument("--summaries", type=Path, required=True)
     parser.add_argument("--output_dir", type=str, default="output")
     parser.add_argument("--filter", type=str, default=None)
-    parser.add_argument("--scripted-run", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--rationality", type=float, default=3.0)
+    parser.add_argument("--rsa_iterations", type=int, default=2)
     return parser.parse_args()
+
+def load_model_safely(model_name, device):
+    """Load model with proper handling of meta tensors"""
+    config = AutoModelForSeq2SeqLM.config_class.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_config(config)
+    
+    # Load state dict manually
+    state_dict = AutoModelForSeq2SeqLM.from_pretrained(
+        model_name, 
+        return_dict=False,
+        state_dict=True
+    )
+    
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model
 
 class RSAReranker:
     def __init__(self, model, tokenizer, device, candidates, source_texts, batch_size=8, rationality=3.0):
@@ -38,151 +54,91 @@ class RSAReranker:
         self.source_texts = source_texts
         self.batch_size = batch_size
         self.rationality = rationality
-        
-        # Ensure max sizes for tensors
-        self.max_source_len = 512
-        self.max_target_len = 128
 
-    def compute_likelihood(self, x: list, y: list, mean=True):
-        """Safe computation of likelihood scores"""
-        try:
-            # Tokenize with explicit max lengths
-            x_tokens = self.tokenizer(
-                x, 
-                max_length=self.max_source_len,
-                padding="max_length",
+    def compute_likelihood(self, texts, summaries):
+        """Compute likelihood scores"""
+        with torch.inference_mode():
+            inputs = self.tokenizer(
+                texts,
+                padding=True,
                 truncation=True,
+                max_length=512,
                 return_tensors="pt"
             ).to(self.device)
             
-            y_tokens = self.tokenizer(
-                y,
-                max_length=self.max_target_len,
-                padding="max_length", 
+            labels = self.tokenizer(
+                summaries,
+                padding=True,
                 truncation=True,
+                max_length=128,
                 return_tensors="pt"
             ).to(self.device)
             
-            with torch.inference_mode():
-                outputs = self.model(
-                    **x_tokens,
-                    labels=y_tokens["input_ids"]
-                )
-                
-                # Get loss per token
-                loss = outputs.loss
-                if mean:
-                    mask = (y_tokens["input_ids"] != self.tokenizer.pad_token_id)
-                    loss = loss / mask.float().sum()
-                
-                return -loss.detach()
-                
-        except Exception as e:
-            logger.error(f"Error in likelihood computation: {str(e)}")
-            return None
+            outputs = self.model(**inputs, labels=labels["input_ids"])
+            return -outputs.loss
 
     def compute_matrix(self):
-        """Compute likelihood matrix with batching and error handling"""
-        matrix = torch.zeros((len(self.source_texts), len(self.candidates))).to(self.device)
+        """Compute likelihood matrix between texts and candidates"""
+        logger.info("Computing likelihood matrix...")
+        matrix = torch.zeros((len(self.source_texts), len(self.candidates)), device=self.device)
         
-        # Process in batches
-        for i in range(0, len(self.source_texts), self.batch_size):
-            sources = self.source_texts[i:i + self.batch_size]
-            
+        for i in tqdm(range(0, len(self.source_texts), self.batch_size)):
             for j in range(0, len(self.candidates), self.batch_size):
-                candidates = self.candidates[j:j + self.batch_size]
+                # Get current batch
+                texts = self.source_texts[i:i + self.batch_size]
+                cands = self.candidates[j:j + self.batch_size]
                 
-                # Create pairs
-                pairs_x = []
-                pairs_y = []
-                indices = []
+                # Process all pairs in batch
+                for k, text in enumerate(texts):
+                    for l, cand in enumerate(cands):
+                        try:
+                            score = self.compute_likelihood([text], [cand])
+                            matrix[i + k, j + l] = score.item()
+                        except Exception as e:
+                            logger.warning(f"Error computing likelihood: {e}")
                 
-                for si, source in enumerate(sources):
-                    for ci, candidate in enumerate(candidates):
-                        pairs_x.append(source)
-                        pairs_y.append(candidate)
-                        indices.append((i + si, j + ci))
+                # Clear cache between batches
+                torch.cuda.empty_cache()
+                gc.collect()
                 
-                # Compute likelihoods for batch
-                if pairs_x:
-                    scores = self.compute_likelihood(pairs_x, pairs_y)
-                    if scores is not None:
-                        for idx, (si, ci) in enumerate(indices):
-                            if si < matrix.shape[0] and ci < matrix.shape[1]:
-                                matrix[si, ci] = scores[idx] if isinstance(scores, torch.Tensor) else scores
-                
-                # Clear cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
         return matrix
 
     def rerank(self, t=2):
-        """Rerank summaries using RSA with step-by-step logging"""
+        """Rerank summaries using RSA"""
         try:
-            logger.info("Starting RSA computation...")
-            
             # Get initial scores
-            logger.info("Computing initial scores...")
             initial_scores = self.compute_matrix()
-            logger.info(f"Initial scores shape: {initial_scores.shape}")
+            logger.info("\nInitial scores computed")
             
-            # Print example initial scores for first source text
-            logger.info("\nInitial scores for first source text:")
-            for i, score in enumerate(initial_scores[0]):
-                logger.info(f"Candidate {i}: {score.item():.4f}")
-            
-            # Compute speaker scores
+            # Initialize speaker scores
             speaker_scores = torch.log_softmax(initial_scores, dim=-1)
-            logger.info("\nInitial speaker probabilities:")
-            for i, score in enumerate(speaker_scores[0]):
-                logger.info(f"Candidate {i}: {score.item():.4f}")
             
-            # Iterate RSA
+            # RSA iterations
             for step in range(t):
-                logger.info(f"\nRSA Iteration {step + 1}")
-                
+                logger.info(f"\nRSA Iteration {step + 1}/{t}")
                 # Listener update
                 listener_scores = torch.log_softmax(speaker_scores, dim=0)
-                logger.info(f"Listener scores for first source text:")
-                for i, score in enumerate(listener_scores[0]):
-                    logger.info(f"Candidate {i}: {score.item():.4f}")
                 
                 # Speaker update with rationality
                 speaker_scores = torch.log_softmax(
                     initial_scores + self.rationality * listener_scores,
                     dim=-1
                 )
-                logger.info(f"Updated speaker scores for first source text:")
-                for i, score in enumerate(speaker_scores[0]):
-                    logger.info(f"Candidate {i}: {score.item():.4f}")
+                
+                # Log probabilities for first example
+                if step == t-1:  # Last iteration
+                    logger.info("\nFinal probabilities for first text:")
+                    probs = speaker_scores[0].exp()
+                    for i, p in enumerate(probs):
+                        logger.info(f"Candidate {i}: {p.item():.4f}")
             
-            logger.info("\nFinal Selection:")
-            # Get best summaries
-            best_rsa = []
-            best_base = []
-            
-            with torch.no_grad():
+            # Get best candidates
+            with torch.inference_mode():
                 rsa_indices = speaker_scores.argmax(dim=1).cpu()
                 base_indices = initial_scores.argmax(dim=1).cpu()
-                
-                for i in range(len(self.source_texts)):
-                    rsa_idx = rsa_indices[i].item()
-                    base_idx = base_indices[i].item()
-                    
-                    if rsa_idx < len(self.candidates):
-                        best_rsa.append(self.candidates[rsa_idx])
-                        if i == 0:  # Print for first source text
-                            logger.info(f"Selected RSA candidate {rsa_idx} with score {speaker_scores[0][rsa_idx].item():.4f}")
-                    else:
-                        best_rsa.append(self.candidates[0])
-                        
-                    if base_idx < len(self.candidates):
-                        best_base.append(self.candidates[base_idx])
-                        if i == 0:  # Print for first source text
-                            logger.info(f"Selected base candidate {base_idx} with score {initial_scores[0][base_idx].item():.4f}")
-                    else:
-                        best_base.append(self.candidates[0])
+            
+            best_rsa = [self.candidates[i.item()] for i in rsa_indices]
+            best_base = [self.candidates[i.item()] for i in base_indices]
             
             return {
                 "success": True,
@@ -199,28 +155,69 @@ class RSAReranker:
                 "error": str(e)
             }
 
-def process_summaries(model, tokenizer, summaries_df, device, batch_size, rationality):
-    """Process all summaries with RSA reranking"""
+def get_device_map():
+    """Determine appropriate device for model loading"""
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+def load_model_safely(model_name):
+    """Load model with proper device handling"""
+    device = get_device_map()
+    logger.info(f"Using device: {device}")
+    
+    try:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            device_map=device,
+            torch_dtype=torch.float32
+        )
+        model.eval()
+        return model, device
+        
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        raise
+
+def main():
+    args = parse_args()
+
+    if args.filter and args.filter not in args.summaries.stem:
+        return
+
+    # Load model with device detection
+    logger.info(f"Loading model: {args.model_name}")
+    model, device = load_model_safely(args.model_name)
+    
+    logger.info("Loading tokenizer...")
+    if "pegasus" in args.model_name:
+        tokenizer = PegasusTokenizer.from_pretrained(args.model_name)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    logger.info("Loading summaries...")
+    summaries = pd.read_csv(args.summaries)
     results = []
     
-    for name, group in tqdm(summaries_df.groupby(["id"])):
+    logger.info("Processing groups...")
+    for name, group in tqdm(summaries.groupby(["id"])):
         # Clear memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         gc.collect()
         
         try:
             reranker = RSAReranker(
                 model=model,
-                tokenizer=tokenizer,
-                device=device,
+                tokenizer=tokenizer, 
+                device=device,  # Use detected device
                 candidates=group.summary.unique().tolist(),
                 source_texts=group.text.unique().tolist(),
-                batch_size=batch_size,
-                rationality=rationality
+                batch_size=args.batch_size,
+                rationality=args.rationality
             )
             
-            result = reranker.rerank()
+            result = reranker.rerank(t=args.rsa_iterations)
             
             if result["success"]:
                 results.append({
@@ -245,49 +242,6 @@ def process_summaries(model, tokenizer, summaries_df, device, batch_size, ration
                 "error": str(e),
                 "gold": group['gold'].iloc[0]
             })
-            
-    return results
-
-def main():
-    args = parse_args()
-
-    if args.filter and args.filter not in args.summaries.stem:
-        return
-
-    # Set memory management
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    torch.backends.cuda.max_split_size_mb = 128  # Reduce memory fragmentation
-    
-    logger.info(f"Loading model: {args.model_name}")
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float32,
-        device_map='auto',  # Use automatic device mapping
-        low_cpu_mem_usage=True
-    )
-    model = model.eval()
-
-    logger.info("Loading tokenizer...")
-    if "pegasus" in args.model_name:
-        tokenizer = PegasusTokenizer.from_pretrained(args.model_name)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-        
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    logger.info("Loading summaries...")
-    summaries = pd.read_csv(args.summaries)
-
-    logger.info("Processing with RSA...")
-    results = process_summaries(
-        model=model,
-        tokenizer=tokenizer,
-        summaries_df=summaries,
-        device=args.device,
-        batch_size=args.batch_size,
-        rationality=args.rationality
-    )
 
     # Save results
     output_dir = Path(args.output_dir)
@@ -298,13 +252,14 @@ def main():
     with open(output_path, "wb") as f:
         dump({
             "results": results,
-            "metadata/model": args.model_name,
-            "metadata/rationality": args.rationality
+            "metadata": {
+                "model": args.model_name,
+                "rationality": args.rationality,
+                "rsa_iterations": args.rsa_iterations
+            }
         }, f)
     
     logger.info(f"Results saved to: {output_path}")
-    if args.scripted_run:
-        print(output_path)
 
 if __name__ == "__main__":
     main()
