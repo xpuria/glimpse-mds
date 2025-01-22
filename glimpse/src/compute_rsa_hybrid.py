@@ -156,6 +156,8 @@ def main():
 
     logger.info("Loading summaries...")
     summaries = pd.read_csv(args.summaries)
+    #temporal
+    summaries = summaries.head()
     results = []
     
     logger.info("Processing groups...")
