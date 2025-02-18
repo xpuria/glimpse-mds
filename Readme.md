@@ -1,7 +1,7 @@
 
+FINAL VERSION IS AVAILABLE VIA [LINK](https://github.com/Marlowess/NLP_project_summarization)
 This is the repositotry of  GLIMPSE: Pragmatically Informative Multi-Document Summarization for Scholarly Reviews
 [Paper](https://arxiv.org/abs/2406.07359) | [Code](https://github.com/icannos/glimpse-mds)
-
 
 ### Installation
 
